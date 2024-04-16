@@ -1,18 +1,13 @@
-/* 
+/*
  * Copyright (c) 2016, salesforce.com, inc.
  * All rights reserved.
- * Licensed under the BSD 3-Clause license. 
+ * Licensed under the BSD 3-Clause license.
  * For full license text, see LICENSE.TXT file in the repo root  or https://opensource.org/licenses/BSD-3-Clause
  */
 package com.salesforce.emp.connector;
 
-import java.net.ConnectException;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
-
+import org.cometd.bayeux.Channel;
+import org.cometd.bayeux.Message;
 import org.cometd.bayeux.client.ClientSessionChannel;
 import org.cometd.client.BayeuxClient;
 import org.cometd.client.transport.LongPollingTransport;
@@ -21,9 +16,21 @@ import org.eclipse.jetty.client.api.Request;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.ConnectException;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+import java.util.function.Function;
+
 /**
  * @author hal.hildebrand
- * @since 202
+ * @since API v37.0
  */
 public class EmpConnector {
     private static final String ERROR = "error";
@@ -45,7 +52,7 @@ public class EmpConnector {
          */
         @Override
         public void cancel() {
-            replay.remove(topic);
+            replay.remove(topicWithoutQueryString(topic));
             if (running.get() && client != null) {
                 client.getChannel(topic).unsubscribe();
                 subscriptions.remove(this);
@@ -58,7 +65,7 @@ public class EmpConnector {
          */
         @Override
         public long getReplayFrom() {
-            return replay.getOrDefault(topic, REPLAY_FROM_EARLIEST);
+            return replay.getOrDefault(topicWithoutQueryString(topic), REPLAY_FROM_TIP);
         }
 
         /*
@@ -76,10 +83,10 @@ public class EmpConnector {
         }
 
         Future<TopicSubscription> subscribe() {
-            Long replayFrom = getReplayFrom();
+            long replayFrom = getReplayFrom();
             ClientSessionChannel channel = client.getChannel(topic);
             CompletableFuture<TopicSubscription> future = new CompletableFuture<>();
-            channel.subscribe((c, message) -> consumer.accept(message.getDataAsMap()), (c, message) -> {
+            channel.subscribe((c, message) -> consumer.accept(message.getDataAsMap()), (message) -> {
                 if (message.isSuccessful()) {
                     future.complete(this);
                 } else {
@@ -103,23 +110,20 @@ public class EmpConnector {
 
     private volatile BayeuxClient client;
     private final HttpClient httpClient;
-    private volatile ScheduledFuture<?> keepAlive;
     private final BayeuxParameters parameters;
     private final ConcurrentMap<String, Long> replay = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean();
-    private final ScheduledExecutorService scheduler;
 
     private final Set<SubscriptionImpl> subscriptions = new CopyOnWriteArraySet<>();
+    private final Set<MessageListenerInfo> listenerInfos = new CopyOnWriteArraySet<>();
+
+    private Function<Boolean, String> bearerTokenProvider;
+    private AtomicBoolean reauthenticate = new AtomicBoolean(false);
 
     public EmpConnector(BayeuxParameters parameters) {
-        this(parameters, Executors.newSingleThreadScheduledExecutor());
-    }
-
-    public EmpConnector(BayeuxParameters parameters, ScheduledExecutorService scheduler) {
         this.parameters = parameters;
         httpClient = new HttpClient(parameters.sslContextFactory());
         httpClient.getProxyConfiguration().getProxies().addAll(parameters.proxies());
-        this.scheduler = scheduler;
     }
 
     /**
@@ -128,34 +132,54 @@ public class EmpConnector {
      */
     public Future<Boolean> start() {
         if (running.compareAndSet(false, true)) {
+            addListener(Channel.META_CONNECT, new AuthFailureListener());
+            addListener(Channel.META_HANDSHAKE, new AuthFailureListener());
+            replay.clear();
             return connect();
         }
-        CompletableFuture<Boolean> future = new CompletableFuture<Boolean>();
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
         future.complete(true);
         return future;
+    }
+
+    /**
+     * Disconnecting Bayeux Client in Emp Connector
+     */
+    private void disconnect() {
+        if (!running.compareAndSet(true, false)) {
+            return;
+        }
+        if (client != null) {
+            log.info("Disconnecting Bayeux Client in EmpConnector");
+            client.disconnect();
+            client = null;
+        }
     }
 
     /**
      * Stop the connector
      */
     public void stop() {
-        if (!running.compareAndSet(true, false)) { return; }
-        if (keepAlive != null) {
-            keepAlive.cancel(true);
-            keepAlive = null;
-        }
-        if (client != null) {
-            client.disconnect();
-            client = null;
-            subscriptions.clear();
-        }
+        disconnect();
         if (httpClient != null) {
             try {
+                log.info("Stopping the http client!");
                 httpClient.stop();
             } catch (Exception e) {
                 log.error("Unable to stop HTTP transport[{}]", parameters.endpoint(), e);
             }
         }
+    }
+
+    /**
+     * Set a bearer token / session id provider function that takes a boolean as input and returns a valid token.
+     * If the input is true, the provider function is supposed to re-authenticate with the Salesforce server
+     * and get a fresh session id or token.
+     *
+     * @param bearerTokenProvider a bearer token provider function.
+     */
+    public void setBearerTokenProvider(Function<Boolean, String> bearerTokenProvider) {
+        this.bearerTokenProvider = bearerTokenProvider;
     }
 
     /**
@@ -175,8 +199,10 @@ public class EmpConnector {
             throw new IllegalStateException(String.format("Connector[%s} has not been started",
                     parameters.endpoint()));
         }
+        topic = topic.replaceAll("/$", "");
 
-        if (replay.putIfAbsent(topic, replayFrom) != null) {
+        final String topicWithoutQueryString = topicWithoutQueryString(topic);
+        if (replay.putIfAbsent(topicWithoutQueryString, replayFrom) != null) {
             throw new IllegalStateException(String.format("Already subscribed to %s [%s]",
                     topic, parameters.endpoint()));
         }
@@ -184,6 +210,19 @@ public class EmpConnector {
         SubscriptionImpl subscription = new SubscriptionImpl(topic, consumer);
 
         return subscription.subscribe();
+    }
+
+    /**
+     * Unsubscribe to a topic subscription
+     *
+     * @param topic
+     *            - the topic subscribed
+     */
+    public void unsubscribe(String topic) {
+        subscriptions.stream()
+                .filter(subscription -> subscription.getTopic().equalsIgnoreCase(topic))
+                .findAny()
+                .ifPresent(SubscriptionImpl::cancel);
     }
 
     /**
@@ -214,26 +253,62 @@ public class EmpConnector {
         return subscribe(topic, REPLAY_FROM_TIP, consumer);
     }
 
+    public EmpConnector addListener(String channel, ClientSessionChannel.MessageListener messageListener) {
+        listenerInfos.add(new MessageListenerInfo(channel, messageListener));
+        return this;
+    }
+
+    public boolean isConnected() {
+        return client != null && client.isConnected();
+    }
+
+    public boolean isDisconnected() {
+        return client == null || client.isDisconnected();
+    }
+
+    public boolean isHandshook() {
+        return client != null && client.isHandshook();
+    }
+
+    public long getLastReplayId(String topic) {
+        return replay.get(topic);
+    }
+
+    private static String topicWithoutQueryString(String fullTopic) {
+        return fullTopic.split("\\?")[0];
+    }
+
     private Future<Boolean> connect() {
-        CompletableFuture<Boolean> future = new CompletableFuture<Boolean>();
-        replay.clear();
+        log.info("EmpConnector connecting");
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+
         try {
-            httpClient.start();
+            if (!httpClient.isStarted()) {
+                httpClient.start();
+            }
         } catch (Exception e) {
             log.error("Unable to start HTTP transport[{}]", parameters.endpoint(), e);
             running.set(false);
             future.complete(false);
             return future;
         }
+
+        String bearerToken = bearerToken();
+
         LongPollingTransport httpTransport = new LongPollingTransport(parameters.longPollingOptions(), httpClient) {
             @Override
             protected void customize(Request request) {
-                request.header(AUTHORIZATION, parameters.bearerToken());
+                request.header(AUTHORIZATION, bearerToken);
             }
         };
+
         client = new BayeuxClient(parameters.endpoint().toExternalForm(), httpTransport);
+
         client.addExtension(new ReplayExtension(replay));
-        client.handshake((c, m) -> {
+
+        addListeners(client);
+
+        client.handshake((m) -> {
             if (!m.isSuccessful()) {
                 Object error = m.get(ERROR);
                 if (error == null) {
@@ -243,18 +318,95 @@ public class EmpConnector {
                         String.format("Cannot connect [%s] : %s", parameters.endpoint(), error)));
                 running.set(false);
             } else {
-                keepAlive = scheduler.scheduleAtFixedRate(() -> {
-                    if (running.get()) {
-                        client.handshake();
-                    }
-                }, parameters.keepAlive(), parameters.keepAlive(), parameters.keepAliveUnit());
-
                 subscriptions.forEach(SubscriptionImpl::subscribe);
-
                 future.complete(true);
             }
         });
 
         return future;
+    }
+
+    private void addListeners(BayeuxClient client) {
+        for (MessageListenerInfo info : listenerInfos) {
+            client.getChannel(info.getChannelName()).addListener(info.getMessageListener());
+        }
+    }
+
+    private String bearerToken() {
+        String bearerToken;
+        if (bearerTokenProvider != null) {
+            bearerToken = bearerTokenProvider.apply(reauthenticate.get());
+            reauthenticate.compareAndSet(true, false);
+        } else {
+            bearerToken = parameters.bearerToken();
+        }
+
+        return bearerToken;
+    }
+
+    private void reconnect() {
+        if (running.compareAndSet(false, true)) {
+            connect();
+        } else {
+            log.error("The current value of running is not as we expect, this means our reconnection may not happen");
+        }
+    }
+
+    /**
+     * Listens to /meta/connect channel messages and handles 401 errors, where client needs
+     * to reauthenticate.
+     */
+    private class AuthFailureListener implements ClientSessionChannel.MessageListener {
+        private static final String ERROR_401 = "401";
+        private static final String ERROR_403 = "403";
+
+        @Override
+        public void onMessage(ClientSessionChannel channel, Message message) {
+            if (!message.isSuccessful()) {
+                if (isError(message, ERROR_401) || isError(message, ERROR_403)) {
+                    reauthenticate.set(true);
+                    disconnect();
+                    reconnect();
+                }
+            }
+        }
+
+        private boolean isError(Message message, String errorCode) {
+            String error = (String)message.get(Message.ERROR_FIELD);
+            String failureReason = getFailureReason(message);
+
+            return (error != null && error.startsWith(errorCode)) ||
+                    (failureReason != null && failureReason.startsWith(errorCode));
+        }
+
+        private String getFailureReason(Message message) {
+            String failureReason = null;
+            Map<String, Object> ext = message.getExt();
+            if (ext != null) {
+                Map<String, Object> sfdc = (Map<String, Object>)ext.get("sfdc");
+                if (sfdc != null) {
+                    failureReason = (String)sfdc.get("failureReason");
+                }
+            }
+            return failureReason;
+        }
+    }
+
+    private static class MessageListenerInfo {
+        private String channelName;
+        private ClientSessionChannel.MessageListener messageListener;
+
+        MessageListenerInfo(String channelName, ClientSessionChannel.MessageListener messageListener) {
+            this.channelName = channelName;
+            this.messageListener = messageListener;
+        }
+
+        String getChannelName() {
+            return channelName;
+        }
+
+        ClientSessionChannel.MessageListener getMessageListener() {
+            return messageListener;
+        }
     }
 }

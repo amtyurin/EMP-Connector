@@ -29,8 +29,8 @@
     </developers>
 
     <scm>
-        <connection>scm:git:git://github.com/forcedotcom/EMP-Connector.git</connection>
-        <developerConnection>scm:git:ssh://github.com:forcedotcom/EMP-Connector.git</developerConnection>
+        <connection>scm:git:git@github.com:forcedotcom/EMP-Connector.git</connection>
+        <developerConnection>scm:git:git@github.com:forcedotcom/EMP-Connector.git</developerConnection>
         <url>https://github.com/forcedotcom/EMP-Connector/tree/master</url>
     </scm>
 
@@ -68,7 +68,7 @@
         <dependency>
             <groupId>org.cometd.java</groupId>
             <artifactId>cometd-java-client</artifactId>
-            <version>3.0.9</version>
+            <version>4.0.4</version>
         </dependency>
         <dependency>
             <groupId>ch.qos.logback</groupId>

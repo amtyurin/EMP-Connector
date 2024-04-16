@@ -24,7 +24,7 @@ import org.xml.sax.helpers.DefaultHandler;
  * A helper to obtain the Authentication bearer token via login
  *
  * @author hal.hildebrand
- * @since 202
+ * @since API v37.0
  */
 public class LoginHelper {
 
@@ -86,7 +86,7 @@ public class LoginHelper {
             + "xmlns:urn='urn:partner.soap.sforce.com'><soapenv:Body>";
 
     // The enterprise SOAP API endpoint used for the login call
-    private static final String SERVICES_SOAP_PARTNER_ENDPOINT = "/services/Soap/u/22.0/";
+    private static final String SERVICES_SOAP_PARTNER_ENDPOINT = "/services/Soap/u/44.0/";
 
     public static BayeuxParameters login(String username, String password) throws Exception {
         return login(new URL(LOGIN_ENDPOINT), username, password);
@@ -113,44 +113,49 @@ public class LoginHelper {
     public static BayeuxParameters login(URL loginEndpoint, String username, String password,
             BayeuxParameters parameters) throws Exception {
         HttpClient client = new HttpClient(parameters.sslContextFactory());
-        client.getProxyConfiguration().getProxies().addAll(parameters.proxies());
-        client.start();
-        URL endpoint = new URL(loginEndpoint, getSoapUri());
-        Request post = client.POST(endpoint.toURI());
-        post.content(new ByteBufferContentProvider("text/xml", ByteBuffer.wrap(soapXmlForLogin(username, password))));
-        post.header("SOAPAction", "''");
-        post.header("PrettyPrint", "Yes");
-        ContentResponse response = post.send();
-        SAXParserFactory spf = SAXParserFactory.newInstance();
-        spf.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        spf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        spf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-        spf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-        spf.setNamespaceAware(true);
-        SAXParser saxParser = spf.newSAXParser();
+        try {
+            client.getProxyConfiguration().getProxies().addAll(parameters.proxies());
+            client.start();
+            URL endpoint = new URL(loginEndpoint, getSoapUri());
+            Request post = client.POST(endpoint.toURI());
+            post.content(new ByteBufferContentProvider("text/xml", ByteBuffer.wrap(soapXmlForLogin(username, password))));
+            post.header("SOAPAction", "''");
+            post.header("PrettyPrint", "Yes");
+            ContentResponse response = post.send();
+            SAXParserFactory spf = SAXParserFactory.newInstance();
+            spf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            spf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            spf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+            spf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            spf.setNamespaceAware(true);
+            SAXParser saxParser = spf.newSAXParser();
 
-        LoginResponseParser parser = new LoginResponseParser();
-        saxParser.parse(new ByteArrayInputStream(response.getContent()), parser);
+            LoginResponseParser parser = new LoginResponseParser();
+            saxParser.parse(new ByteArrayInputStream(response.getContent()), parser);
 
-        String sessionId = parser.sessionId;
-        if (sessionId == null || parser.serverUrl == null) { throw new ConnectException(
-                String.format("Unable to login: %s", parser.faultstring)); }
+            String sessionId = parser.sessionId;
+            if (sessionId == null || parser.serverUrl == null) { throw new ConnectException(
+                    String.format("Unable to login: %s", parser.faultstring)); }
 
-        URL soapEndpoint = new URL(parser.serverUrl);
-        String cometdEndpoint = Float.parseFloat(parameters.version()) < 37 ? COMETD_REPLAY_OLD : COMETD_REPLAY;
-        URL replayEndpoint = new URL(soapEndpoint.getProtocol(), soapEndpoint.getHost(), soapEndpoint.getPort(),
-                new StringBuilder().append(cometdEndpoint).append(parameters.version()).toString());
-        return new DelegatingBayeuxParameters(parameters) {
-            @Override
-            public String bearerToken() {
-                return sessionId;
-            }
+            URL soapEndpoint = new URL(parser.serverUrl);
+            String cometdEndpoint = Float.parseFloat(parameters.version()) < 37 ? COMETD_REPLAY_OLD : COMETD_REPLAY;
+            URL replayEndpoint = new URL(soapEndpoint.getProtocol(), soapEndpoint.getHost(), soapEndpoint.getPort(),
+                    new StringBuilder().append(cometdEndpoint).append(parameters.version()).toString());
+            return new DelegatingBayeuxParameters(parameters) {
+                @Override
+                public String bearerToken() {
+                    return sessionId;
+                }
 
-            @Override
-            public URL endpoint() {
-                return replayEndpoint;
-            }
-        };
+                @Override
+                public URL endpoint() {
+                    return replayEndpoint;
+                }
+            };
+        } finally {
+            client.stop();
+            client.destroy();
+        }
     }
 
     private static String getSoapUri() {

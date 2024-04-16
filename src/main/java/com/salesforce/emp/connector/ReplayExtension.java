@@ -1,7 +1,7 @@
-/* 
+/*
  * Copyright (c) 2016, salesforce.com, inc.
  * All rights reserved.
- * Licensed under the BSD 3-Clause license. 
+ * Licensed under the BSD 3-Clause license.
  * For full license text, see LICENSE.TXT file in the repo root  or https://opensource.org/licenses/BSD-3-Clause
  */
 package com.salesforce.emp.connector;
@@ -21,7 +21,7 @@ import org.cometd.bayeux.client.ClientSession.Extension.Adapter;
  * The Bayeux extension for replay
  *
  * @author hal.hildebrand
- * @since 202
+ * @since API v37.0
  */
 public class ReplayExtension extends Adapter {
     private static final String EXTENSION_NAME = "replay";
@@ -40,7 +40,8 @@ public class ReplayExtension extends Adapter {
         Long replayId = getReplayId(message);
         if (this.supported.get() && replayId != null) {
             try {
-                dataMap.put(message.getChannel(), replayId);
+                String channel = topicWithoutQueryString(message.getChannel());
+                dataMap.put(channel, replayId);
             } catch (ClassCastException e) {
                 return false;
             }
@@ -88,5 +89,9 @@ public class ReplayExtension extends Adapter {
         catch (NullPointerException e) {
             return Optional.empty();
         }
+    }
+
+    private static String topicWithoutQueryString(String fullTopic) {
+        return fullTopic.split("\\?")[0];
     }
 }
